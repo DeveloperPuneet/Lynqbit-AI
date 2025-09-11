@@ -1,0 +1,3 @@
+torch
+pymongo
+python-dotenv
