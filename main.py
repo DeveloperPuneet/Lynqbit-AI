@@ -36,8 +36,8 @@ word2idx = {w: i for i, w in enumerate(sorted(all_words))}
 idx2word = {i: w for w, i in word2idx.items()}
 
 vocab_size = len(word2idx)
-hidden_size = 128
-teacher_forcing_ratio = 0.5
+hidden_size = 512 # admin
+teacher_forcing_ratio = 0.7
 top_k = 5  # top-k sampling for varied output
 
 # Set device
@@ -54,7 +54,7 @@ class Seq2Seq(nn.Module):
         self.decoder = nn.GRU(hidden_size, hidden_size, batch_first=True)
         self.fc = nn.Linear(hidden_size, vocab_size)
 
-    def forward(self, src, tgt=None, max_len=50):
+    def forward(self, src, tgt=None, max_len=80):
         # Encoder
         embedded = self.embedding(src)
         _, hidden = self.encoder(embedded)
@@ -99,10 +99,10 @@ a_batch = a_batch.to(device)
 
 # ------------------ Training ------------------
 model = Seq2Seq(vocab_size, hidden_size).to(device)
-optimizer = optim.Adam(model.parameters(), lr=0.005)
+optimizer = optim.Adam(model.parameters(), lr=0.002)
 criterion = nn.CrossEntropyLoss(ignore_index=word2idx[PAD_TOKEN])
 
-epochs = 150
+epochs = 400
 for epoch in range(epochs):
     model.train()
     optimizer.zero_grad()
