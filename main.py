@@ -16,12 +16,12 @@ EOS_TOKEN = "<EOS>" # End token 🏁
 PAD_TOKEN = "<PAD>" # Padding token 🧱
 
 # ------------------ Model parameters ------------------
-d_model = 128 # Embedding dimension 📏
+d_model = 256 # Embedding dimension 📏
 num_heads = 8 # Attention heads count 🧠
 num_layers = 4 # Transformer layers count 🧱
 max_len = 60 # Maximum sequence length 📏
 batch_size = 16 # Batch size 📦
-temperature = 0.8 # Sampling temperature 🌡️
+temperature = 0.95 # Sampling temperature 🌡️
 top_p = 0.92 # Nucleus sampling parameter ☢️
 repetition_penalty = 1.2 # Repetition penalty factor ⚖️
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu") # Use GPU if available 🚀
