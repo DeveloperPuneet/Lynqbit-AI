@@ -1,3 +1,7 @@
 torch
 pymongo
 python-dotenv
+fastapi
+uvicorn
+torch
+pydantic
