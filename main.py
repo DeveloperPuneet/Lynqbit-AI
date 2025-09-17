@@ -15,7 +15,7 @@ MAX_SESSION_TURNS = 50  # number of recent turns that influence responses
 
 
 # ------------------ Flags ------------------
-TRAIN_MODE = True  # set to False if you only want to chat with the saved model
+TRAIN_MODE = False  # set to False if you only want to chat with the saved model
 
 # ------------------ Special tokens ------------------
 SOS_TOKEN = "<SOS>"  # Start token 🏁
