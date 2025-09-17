@@ -79,11 +79,7 @@ python main.py
 ## 📂 Project Structure
 ```
 lynqbit-ai/
-│── examples/        # Example scripts and notebooks
 │── data/            # Datasets and Q&A samples
-│── prompts/         # Prompt engineering templates
-│── src/             # Core library code
-│── tests/           # Unit and integration tests
 │── CONTRIBUTING.md  # Guidelines for contributors
 │── SECURITY.md      # Security policy
 │── CODE_OF_CONDUCT.md
