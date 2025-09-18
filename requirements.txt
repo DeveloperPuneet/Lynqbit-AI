@@ -1,7 +1,11 @@
 torch
+torchvision
+torchaudio
+tokenizers
+nltk
+numpy
+requests
+beautifulsoup4
+gradio
 pymongo
 python-dotenv
-fastapi
-uvicorn
-torch
-pydantic

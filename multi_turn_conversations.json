@@ -1,0 +1,12 @@
+[
+  [
+    {"user": "hello", "assistant": "hi there how can i help you"},
+    {"user": "what is your name", "assistant": "my name is lynqbit"},
+    {"user": "that's a nice name", "assistant": "thank you i like it too"}
+  ],
+  [
+    {"user": "hi", "assistant": "hello how are you"},
+    {"user": "i'm good thanks", "assistant": "that's great to hear"},
+    {"user": "what can you do", "assistant": "i can chat with you and answer questions"}
+  ]
+]

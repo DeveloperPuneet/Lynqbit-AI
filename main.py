@@ -120,6 +120,76 @@ class MultiTurnDataset(Dataset):
         
         return context, target
 
+class PretrainDataset(Dataset):
+    def __init__(self, file_path, tokenizer, block_size=128):
+        with open(file_path, "r", encoding="utf-8") as f:
+            text = f.read()
+        self.encodings = tokenizer.encode(text).ids
+        self.block_size = block_size
+
+    def __len__(self):
+        return len(self.encodings) - self.block_size
+
+    def __getitem__(self, idx):
+        x = self.encodings[idx:idx+self.block_size]
+        y = self.encodings[idx+1:idx+self.block_size+1]
+        return torch.tensor(x), torch.tensor(y)
+
+class TransformerLM(nn.Module):
+    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=4, dropout=0.3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Embedding(512, d_model)
+
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        self.fc = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        b, t = x.size()
+        positions = torch.arange(0, t).unsqueeze(0).to(x.device)
+        x = self.embedding(x) + self.pos_emb(positions)
+        x = self.transformer(x)
+        return self.fc(x)
+
+def pretrain_model(file_path="english_model.txt", epochs=5):
+    print(">>> Starting Pretraining on English corpus...")
+    # Train tokenizer if not already done
+    global bpe_tokenizer
+    if bpe_tokenizer is None:
+        bpe_tokenizer = ByteLevelBPETokenizer()
+        bpe_tokenizer.train(files=file_path, vocab_size=VOCAB_SIZE, min_frequency=2)
+        bpe_tokenizer.save_model("tokenizer")
+
+    dataset = PretrainDataset(file_path, bpe_tokenizer, block_size=128)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    vocab_size = bpe_tokenizer.get_vocab_size()
+    model = TransformerLM(vocab_size, d_model=d_model, nhead=num_heads, num_layers=num_layers, dropout=dropout_rate).to(device)
+
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(epochs):
+        total_loss = 0
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            optimizer.zero_grad()
+            logits = model(x)
+            loss = criterion(logits.view(-1, vocab_size), y.view(-1))
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        print(f"[Pretrain] Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(loader):.4f}")
+
+    torch.save(model.state_dict(), "pretrained_model.pt")
+    print(">>> Pretraining finished. Model saved as pretrained_model.pt")
+    return model, bpe_tokenizer
+
+
+
 # ------------------ BPE Tokenizer Functions ------------------
 def train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE):
     """Train a BPE tokenizer on the provided texts"""
@@ -683,6 +753,14 @@ def scrape_conversation_data(url, max_pages=5):
 
 # ------------------ Training / Inference ------------------
 if TRAIN_MODE:
+    # First pretrain on English corpus
+    pretrained_model, pretrained_tokenizer = None, None
+    if os.path.exists("english_model.txt"):
+        pretrained_model, pretrained_tokenizer = pretrain_model("english_model.txt", epochs=10)
+        print("✅ Pretraining completed on English corpus")
+    else:
+        print("⚠️  english_model.txt not found, skipping pretraining")
+    
     # Load training data
     try:
         from pymongo import MongoClient
@@ -768,29 +846,34 @@ if TRAIN_MODE:
 
     # Train or load BPE tokenizer
     if USE_BPE_TOKENIZATION:
-        # Check if tokenizer files exist and are valid
-        vocab_path = "tokenizer/vocab.json"
-        merges_path = "tokenizer/merges.txt"
-        tokenizer_json_path = "tokenizer/tokenizer.json"
-        
-        tokenizer_valid = (
-            os.path.exists(vocab_path) and 
-            os.path.exists(merges_path) and 
-            os.path.getsize(vocab_path) > 0 and 
-            os.path.getsize(merges_path) > 0
-        )
-        
-        if tokenizer_valid:
-            bpe_tokenizer = load_bpe_tokenizer()
-            if bpe_tokenizer is not None:
-                print("Loaded pre-trained BPE tokenizer")
-            else:
-                print("Failed to load BPE tokenizer, training a new one...")
-                bpe_tokenizer = train_bpe_tokenizer(all_texts)
+        # If we have a pretrained tokenizer, use it
+        if pretrained_tokenizer is not None:
+            bpe_tokenizer = pretrained_tokenizer
+            print("Using pretrained BPE tokenizer")
         else:
-            print("Training new BPE tokenizer...")
-            bpe_tokenizer = train_bpe_tokenizer(all_texts)
-            print("Trained new BPE tokenizer")
+            # Check if tokenizer files exist and are valid
+            vocab_path = "tokenizer/vocab.json"
+            merges_path = "tokenizer/merges.txt"
+            tokenizer_json_path = "tokenizer/tokenizer.json"
+            
+            tokenizer_valid = (
+                os.path.exists(vocab_path) and 
+                os.path.exists(merges_path) and 
+                os.path.getsize(vocab_path) > 0 and 
+                os.path.getsize(merges_path) > 0
+            )
+            
+            if tokenizer_valid:
+                bpe_tokenizer = load_bpe_tokenizer()
+                if bpe_tokenizer is not None:
+                    print("Loaded pre-trained BPE tokenizer")
+                else:
+                    print("Failed to load BPE tokenizer, training a new one...")
+                    bpe_tokenizer = train_bpe_tokenizer(all_texts)
+            else:
+                print("Training new BPE tokenizer...")
+                bpe_tokenizer = train_bpe_tokenizer(all_texts)
+                print("Trained new BPE tokenizer")
         
         if bpe_tokenizer is not None:
             vocab_size = bpe_tokenizer.get_vocab_size()
@@ -866,11 +949,27 @@ if TRAIN_MODE:
                                dropout=dropout_rate, 
                                padding_idx=padding_idx).to(device)
     
+    # Load pretrained weights if available
+    if pretrained_model is not None:
+        print("Loading pretrained weights...")
+        # Map pretrained weights to our model architecture
+        pretrained_dict = pretrained_model.state_dict()
+        model_dict = model.state_dict()
+        
+        # Filter out unnecessary keys and mismatched sizes
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() 
+                          if k in model_dict and v.size() == model_dict[k].size()}
+        
+        # Update the model's dictionary with pretrained weights
+        model_dict.update(pretrained_dict)
+        model.load_state_dict(model_dict)
+        print("✅ Pretrained weights loaded")
+    
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
     criterion = nn.CrossEntropyLoss(ignore_index=padding_idx)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.8)
     
-    epochs = 80
+    epochs = 200
     min_val_loss = float("inf")
     patience_counter = 0
     early_stopping_patience = 12
@@ -1075,24 +1174,40 @@ else:
     model.eval()
     print("Loaded model from best_model.pth")
 
-# ------------------ Chat loop ------------------
-if not TRAIN_MODE:
+    # ------------------ Load Pretrained English Model if available ------------------
+    if os.path.exists("pretrained_model.pt"):
+        print("Loading pretrained English model for enhanced understanding...")
+        pretrained_model = TransformerLM(
+            vocab_size,
+            d_model=d_model,
+            nhead=num_heads,
+            num_layers=num_layers,
+            dropout=dropout_rate
+        ).to(device)
+        pretrained_model.load_state_dict(torch.load("pretrained_model.pt", map_location=device))
+        pretrained_model.eval()
+        print("✅ Pretrained English model loaded for enhanced understanding")
+
     import gradio as gr
 
-    # Keep chat history in memory
-    MAX_MEMORY_TURNS = 6
-    chat_history = []
+    # ------------------ Session Memory ------------------
+    session_memory = []
+    MAX_SESSION_TURNS = 50
 
+    # ------------------ Chat Helpers ------------------
+    def clean_text(text):
+        return text.strip()
+
+    # ------------------ Chat Function ------------------
     def chat(user_input, history):
-        global chat_history, session_memory, CURRENT_PERSONALITY
-        
-        # Handle special commands
+        global session_memory, CURRENT_PERSONALITY
+
+        # Handle clear command
         if user_input.strip().lower() == "!clear":
-            chat_history = []
             session_memory = []
             return [], []
-        
-        # Check for personality change commands
+
+        # Handle personality switch
         if user_input.strip().lower().startswith("!personality"):
             parts = user_input.split()
             if len(parts) > 1:
@@ -1108,52 +1223,51 @@ if not TRAIN_MODE:
                     history = history or []
                     history.append((user_input, response))
                     return history, history
-        
-        # Clean and update vocabulary with user input
+
         cleaned_input = clean_text(user_input)
-        
-        # Build context from session memory with personality
+
+        # Build context from session memory
         context = build_context_from_memory()
-        
-        # Add current user input to context
-        intent = detect_intent(cleaned_input)
-        full_context = f"{context} {intent} user: {cleaned_input}"
-        
-        # Generate response
+        full_context = f"{context} {detect_intent(cleaned_input)} user: {cleaned_input}"
+
+        # Generate response using the main model
         response = generate_coherent_response(
-            full_context, 
-            model, 
+            full_context,
+            model,
             word2idx if not USE_BPE_TOKENIZATION else None,
             idx2word if not USE_BPE_TOKENIZATION else None,
-            max_length=30
+            max_length=30,
+            temperature_local=temperature,
+            top_p_local=top_p,
+            repetition_penalty_local=repetition_penalty
         )
-        
+
         # Add personality emoji
         personality_emoji = PERSONALITY_TOKENS.get(CURRENT_PERSONALITY, "")
         if response and personality_emoji:
             response = f"{response} {personality_emoji}"
-        
+
         # Update session memory
         session_memory.append((cleaned_input, response))
-        
-        # Perform online learning if enabled
+
+        # Mini replay / online learning
         if MINI_REPLAY_ENABLED:
             online_learning_update(cleaned_input, response)
-        
-        # Log to CSV if enabled
+
+        # Logging
         if LOGGING_ENABLED:
             log_to_csv(user_input, response)
-        
-        # Update chat history for UI
+
+        # Update chat history
         history = history or []
         history.append((user_input, response))
         return history, history
 
-    # Launch chat interface
+    # ------------------ Gradio UI ------------------
     with gr.Blocks() as demo:
         gr.Markdown("## 😼 Lynqbit Chatbot with Enhanced Features")
         gr.Markdown("**Features:** BPE Tokenization | Multi-turn Conversations | Personality Tokens | Data Augmentation")
-        
+
         # Personality selector
         gr.Markdown("### 🎭 Select Personality")
         personality_radio = gr.Radio(
@@ -1161,24 +1275,24 @@ if not TRAIN_MODE:
             value=CURRENT_PERSONALITY,
             label="Personality"
         )
-        
+
         def update_personality(personality):
             global CURRENT_PERSONALITY
             CURRENT_PERSONALITY = personality
             return f"Personality set to {personality} {PERSONALITY_TOKENS[personality]}"
-        
+
         personality_radio.change(update_personality, inputs=personality_radio, outputs=gr.Textbox(visible=False))
-        
+
         # Chat interface
         chatbot = gr.Chatbot(label="Conversation History", height=500)
         msg = gr.Textbox(label="Your Message", placeholder="Type your message here...")
         clear_btn = gr.Button("Clear Chat")
-        
+
         def respond(message, chat_history):
             return chat(message, chat_history)
-        
+
         msg.submit(respond, [msg, chatbot], [chatbot, msg])
         clear_btn.click(lambda: ([], []), None, [chatbot, msg], queue=False)
-        
+
         demo.launch(server_name="0.0.0.0", server_port=7860)
         
