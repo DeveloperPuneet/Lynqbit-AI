@@ -39,8 +39,15 @@ session_memory = []  # stores (user_input, lynqbit_response)
 MAX_SESSION_TURNS = 50
 
 # ------------------ BPE Tokenizer ------------------
-bpe_tokenizer = None
 VOCAB_SIZE = 10000  # Target vocabulary size for BPE
+# Robust global variable initialization
+global bpe_tokenizer, word2idx, idx2word, model, optimizer, vocab_size
+bpe_tokenizer = None
+word2idx = None
+idx2word = None
+model = None
+optimizer = None
+vocab_size = None
 
 # ------------------ Personality/Style Tokens ------------------
 PERSONALITY_TOKENS = {
@@ -66,6 +73,7 @@ INTENT_TOKENS = {
 
 # ------------------ Flags ------------------
 TRAIN_MODE = True
+ENGLISH_MODEL_TRAIN = False  # Set to False to skip English model pretraining
 DEBUG_THINKING = True
 MINI_REPLAY_ENABLED = True
 LOGGING_ENABLED = True
@@ -84,7 +92,7 @@ SPECIAL_TOKENS = [SOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN] + list(PERSONALITY
 d_model = 256
 num_heads = 8
 num_layers = 4
-max_len = 60
+max_len = 256  # Increased from 60 to 256 for better context
 batch_size = 16
 temperature = 1.0
 top_p = 0.98
@@ -121,37 +129,97 @@ class MultiTurnDataset(Dataset):
         return context, target
 
 class PretrainDataset(Dataset):
-    def __init__(self, file_path, tokenizer, block_size=128):
+    def __init__(self, file_path, tokenizer, block_size=256):
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
-        self.encodings = tokenizer.encode(text).ids
-        self.block_size = block_size
+        
+        # Split text into sentences for better training
+        sentences = re.split(r'(?<=[.!?]) +', text)
+        self.samples = []
+        
+        for i in range(len(sentences) - 1):
+            # Create source-target pairs from consecutive sentences
+            source = sentences[i]
+            target = sentences[i + 1]
+            
+            if len(source.split()) > 3 and len(target.split()) > 3:  # Filter very short sentences
+                source_tokens = tokenizer.encode(source).ids
+                target_tokens = tokenizer.encode(target).ids
+                
+                # Limit length
+                source_tokens = source_tokens[:block_size//2]
+                target_tokens = target_tokens[:block_size//2]
+                
+                if source_tokens and target_tokens:
+                    self.samples.append((source_tokens, target_tokens))
 
     def __len__(self):
-        return len(self.encodings) - self.block_size
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        x = self.encodings[idx:idx+self.block_size]
-        y = self.encodings[idx+1:idx+self.block_size+1]
-        return torch.tensor(x), torch.tensor(y)
+        source, target = self.samples[idx]
+        return torch.tensor(source), torch.tensor(target)
 
-class TransformerLM(nn.Module):
-    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=4, dropout=0.3):
+# ------------------ Custom Collate Function for Pretraining ------------------
+def pretrain_collate_fn(batch):
+    """Custom collate function for pretraining dataset"""
+    sources, targets = zip(*batch)
+    
+    # Pad sequences
+    sources_padded = pad_sequence(sources, batch_first=True, padding_value=0)
+    targets_padded = pad_sequence(targets, batch_first=True, padding_value=0)
+    
+    return sources_padded, targets_padded
+
+# ------------------ Unified Transformer Model ------------------
+class ImprovedTransformer(nn.Module):
+    def __init__(self, vocab_size, d_model, num_heads=8, num_layers=4, max_len=256, dropout=0.1, padding_idx=None):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(512, d_model)
+        self.tok_embed = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_len, d_model))
+        self.dropout = nn.Dropout(dropout)
 
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=d_model * 4,
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.fc = nn.Linear(d_model, vocab_size)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=d_model * 4,
+            batch_first=True,
+            dropout=dropout,
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
 
-    def forward(self, x):
-        b, t = x.size()
-        positions = torch.arange(0, t).unsqueeze(0).to(x.device)
-        x = self.embedding(x) + self.pos_emb(positions)
-        x = self.transformer(x)
-        return self.fc(x)
+        self.out = nn.Linear(d_model, vocab_size)
+
+    def forward(
+        self,
+        src,
+        tgt,
+        src_key_padding_mask=None,
+        tgt_key_padding_mask=None,
+        tgt_mask=None,
+        memory_key_padding_mask=None,
+    ):
+        src_emb = self.dropout(self.tok_embed(src) + self.pos_embed[:, : src.size(1), :])
+        tgt_emb = self.dropout(self.tok_embed(tgt) + self.pos_embed[:, : tgt.size(1), :])
+
+        memory = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
+        output = self.decoder(
+            tgt_emb,
+            memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=src_key_padding_mask,
+        )
+        return self.out(output)
 
 def pretrain_model(file_path="english_model.txt", epochs=5):
     print(">>> Starting Pretraining on English corpus...")
@@ -159,36 +227,95 @@ def pretrain_model(file_path="english_model.txt", epochs=5):
     global bpe_tokenizer
     if bpe_tokenizer is None:
         bpe_tokenizer = ByteLevelBPETokenizer()
-        bpe_tokenizer.train(files=file_path, vocab_size=VOCAB_SIZE, min_frequency=2)
+        bpe_tokenizer.train(files=file_path, vocab_size=VOCAB_SIZE, min_frequency=2, special_tokens=SPECIAL_TOKENS)
         bpe_tokenizer.save_model("tokenizer")
 
     dataset = PretrainDataset(file_path, bpe_tokenizer, block_size=128)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=pretrain_collate_fn)
 
     vocab_size = bpe_tokenizer.get_vocab_size()
-    model = TransformerLM(vocab_size, d_model=d_model, nhead=num_heads, num_layers=num_layers, dropout=dropout_rate).to(device)
+    padding_idx = bpe_tokenizer.token_to_id(PAD_TOKEN)
+    model = ImprovedTransformer(vocab_size, d_model=d_model, num_heads=num_heads, 
+                               num_layers=num_layers, max_len=max_len, 
+                               dropout=dropout_rate, padding_idx=padding_idx).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=3e-4)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=padding_idx)
 
     for epoch in range(epochs):
         total_loss = 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
+        model.train()
+        
+        for src, tgt in loader:
+            src, tgt = src.to(device), tgt.to(device)
+            
+            # Add SOS and EOS tokens
+            sos_tensor = torch.full((src.size(0), 1), bpe_tokenizer.token_to_id(SOS_TOKEN), device=device)
+            eos_tensor = torch.full((tgt.size(0), 1), bpe_tokenizer.token_to_id(EOS_TOKEN), device=device)
+            
+            src = torch.cat([sos_tensor, src, eos_tensor], dim=1)
+            tgt_input = torch.cat([sos_tensor, tgt], dim=1)
+            tgt_output = torch.cat([tgt, eos_tensor], dim=1)
+            
+            # Pad sequences
+            src = pad_sequence([s for s in src], batch_first=True, padding_value=padding_idx)
+            tgt_input = pad_sequence([t for t in tgt_input], batch_first=True, padding_value=padding_idx)
+            tgt_output = pad_sequence([t for t in tgt_output], batch_first=True, padding_value=padding_idx)
+            
+            # Truncate to max_len
+            src = src[:, :max_len]
+            tgt_input = tgt_input[:, :max_len]
+            tgt_output = tgt_output[:, :max_len]
+            
+            # Create masks
+            src_padding_mask = (src == padding_idx).to(device)
+            tgt_padding_mask = (tgt_input == padding_idx).to(device)
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt_input.size(1)).to(device)
+            
             optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits.view(-1, vocab_size), y.view(-1))
+            output = model(
+                src,
+                tgt_input,
+                src_key_padding_mask=src_padding_mask,
+                tgt_key_padding_mask=tgt_padding_mask,
+                tgt_mask=tgt_mask,
+            )
+            
+            loss = criterion(output.reshape(-1, vocab_size), tgt_output.reshape(-1))
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
-        print(f"[Pretrain] Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(loader):.4f}")
+        avg_loss = total_loss / len(loader)
+        print(f"[Pretrain] Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
+        
+        # Sample from the model during pretraining
+        if epoch % 2 == 0:
+            model.eval()
+            with torch.no_grad():
+                test_prompts = [
+                    "What is",
+                    "The weather is",
+                    "I like to",
+                    "Hello, how are you",
+                    "Can you tell me about"
+                ]
+                
+                print("\n📝 Pretraining Samples:")
+                for prompt in test_prompts:
+                    tokens = text_to_bpe_tokens(prompt, add_special_tokens=False)
+                    src = torch.tensor([tokens], device=device)
+                    
+                    # Generate response
+                    response = generate_response(src, model, bpe_tokenizer, max_length=20)
+                    print(f"  '{prompt}' -> '{response}'")
+                print()
+            
+            model.train()
 
     torch.save(model.state_dict(), "pretrained_model.pt")
     print(">>> Pretraining finished. Model saved as pretrained_model.pt")
     return model, bpe_tokenizer
-
-
 
 # ------------------ BPE Tokenizer Functions ------------------
 def train_bpe_tokenizer(texts, vocab_size=VOCAB_SIZE):
@@ -237,26 +364,19 @@ def load_bpe_tokenizer():
     # Check if tokenizer files exist
     vocab_path = "tokenizer/vocab.json"
     merges_path = "tokenizer/merges.txt"
-    tokenizer_json_path = "tokenizer/tokenizer.json"
     
     # If files are empty or don't exist, return None
     if not os.path.exists(vocab_path) or not os.path.exists(merges_path):
         print("BPE tokenizer files not found")
         return None
     
-    if (os.path.getsize(vocab_path) == 0 or 
-        os.path.getsize(merges_path) == 0 or
-        (os.path.exists(tokenizer_json_path) and os.path.getsize(tokenizer_json_path) == 0)):
+    if (os.path.getsize(vocab_path) == 0 or os.path.getsize(merges_path) == 0):
         print("BPE tokenizer files are empty or corrupted")
         return None
     
     try:
-        # Try to load from tokenizer.json first
-        if os.path.exists(tokenizer_json_path):
-            bpe_tokenizer = ByteLevelBPETokenizer.from_file(tokenizer_json_path)
-        else:
-            # Fall back to vocab.json and merges.txt
-            bpe_tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path)
+        # Load from vocab.json and merges.txt for consistency
+        bpe_tokenizer = ByteLevelBPETokenizer(vocab_path, merges_path)
         
         # Set post-processing template
         bpe_tokenizer.post_processor = TemplateProcessing(
@@ -289,7 +409,12 @@ def text_to_bpe_tokens(text, add_special_tokens=True):
     encoding = bpe_tokenizer.encode(text)
     if add_special_tokens:
         # Manually add SOS and EOS tokens
-        return [bpe_tokenizer.token_to_id(SOS_TOKEN)] + encoding.ids + [bpe_tokenizer.token_to_id(EOS_TOKEN)]
+        sos_id = bpe_tokenizer.token_to_id(SOS_TOKEN)
+        eos_id = bpe_tokenizer.token_to_id(EOS_TOKEN)
+        if sos_id is None or eos_id is None:
+            # Fallback if special tokens not in tokenizer
+            return [0] + encoding.ids + [1]
+        return [sos_id] + encoding.ids + [eos_id]
     return encoding.ids
 
 def bpe_tokens_to_text(token_ids):
@@ -311,16 +436,17 @@ def bpe_tokens_to_text(token_ids):
     eos_id = bpe_tokenizer.token_to_id(EOS_TOKEN)
     pad_id = bpe_tokenizer.token_to_id(PAD_TOKEN)
     
-    filtered_ids = [id for id in token_ids if id not in [sos_id, eos_id, pad_id]]
+    filtered_ids = [id for id in token_ids if id not in [sos_id, eos_id, pad_id] and id is not None]
     return bpe_tokenizer.decode(filtered_ids, skip_special_tokens=True)
 
 # ------------------ Text preprocessing ------------------
 def clean_text(text):
-    """Lowercase and remove most special characters"""
+    """Lowercase and remove special characters, keeping basic punctuation"""
     if not isinstance(text, str):
         return ""
     text = text.lower()
-    text = re.sub(r"[^a-z0-9<>\s.!?]", " ", text)
+    # Keep letters, numbers, basic punctuation, and special tokens
+    text = re.sub(r"[^a-z0-9<>\s.,!?']", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -445,13 +571,13 @@ def online_learning_update(user_input, response):
     
     if USE_BPE_TOKENIZATION and bpe_tokenizer:
         criterion = nn.CrossEntropyLoss(ignore_index=bpe_tokenizer.token_to_id(PAD_TOKEN))
-        src_tensor = torch.tensor([text_to_bpe_tokens(user_input, add_special_tokens=False)], device=device)
+        src_tensor = torch.tensor([text_to_bpe_tokens(user_input, add_special_tokens=True)], device=device)
         tgt_tensor = torch.tensor([text_to_bpe_tokens(response, add_special_tokens=True)], device=device)
     else:
         criterion = nn.CrossEntropyLoss(ignore_index=word2idx[PAD_TOKEN])
         src_text = clean_text(user_input)
         tgt_text = clean_text(response)
-        src_tensor = text_to_tensor(src_text.split() + [EOS_TOKEN], word2idx).unsqueeze(0)
+        src_tensor = text_to_tensor([SOS_TOKEN] + src_text.split() + [EOS_TOKEN], word2idx).unsqueeze(0)
         tgt_tensor = text_to_tensor([SOS_TOKEN] + tgt_text.split() + [EOS_TOKEN], word2idx).unsqueeze(0)
     
     # Forward pass
@@ -507,56 +633,6 @@ def log_to_csv(user_input, response):
             intent,
             len(session_memory)
         ])
-
-# ------------------ Model ------------------
-class ImprovedTransformer(nn.Module):
-    def __init__(self, vocab_size, d_model, num_heads=8, num_layers=4, max_len=60, dropout=0.1, padding_idx=None):
-        super().__init__()
-        self.tok_embed = nn.Embedding(vocab_size, d_model, padding_idx=padding_idx)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_len, d_model))
-        self.dropout = nn.Dropout(dropout)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=num_heads,
-            dim_feedforward=d_model * 4,
-            batch_first=True,
-            dropout=dropout,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=d_model,
-            nhead=num_heads,
-            dim_feedforward=d_model * 4,
-            batch_first=True,
-            dropout=dropout,
-        )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
-
-        self.out = nn.Linear(d_model, vocab_size)
-
-    def forward(
-        self,
-        src,
-        tgt,
-        src_key_padding_mask=None,
-        tgt_key_padding_mask=None,
-        tgt_mask=None,
-        memory_key_padding_mask=None,
-    ):
-        src_emb = self.dropout(self.tok_embed(src) + self.pos_embed[:, : src.size(1), :])
-        tgt_emb = self.dropout(self.tok_embed(tgt) + self.pos_embed[:, : tgt.size(1), :])
-
-        memory = self.encoder(src_emb, src_key_padding_mask=src_key_padding_mask)
-        output = self.decoder(
-            tgt_emb,
-            memory,
-            tgt_mask=tgt_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=src_key_padding_mask,
-        )
-        return self.out(output)
 
 # ------------------ Helpers ------------------
 def text_to_tensor(words, word2idx):
@@ -619,13 +695,57 @@ def top_p_filter(probs, top_p):
         return probs
     return filtered / filtered.sum()
 
+# ------------------ Generation Helper ------------------
+def generate_response(src, model, tokenizer, max_length=256, temperature_local=1.0, top_p_local=0.9):
+    """Generate response from source tokens"""
+    model.eval()
+    
+    with torch.no_grad():
+        # Start with SOS token
+        tgt = torch.tensor([[tokenizer.token_to_id(SOS_TOKEN)]], device=device)
+        
+        generated_tokens = []
+        
+        for step in range(max_length):
+            # Create masks
+            src_padding_mask = (src == tokenizer.token_to_id(PAD_TOKEN)).to(device)
+            tgt_padding_mask = (tgt == tokenizer.token_to_id(PAD_TOKEN)).to(device)
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(tgt.size(1)).to(device)
+            
+            # Get output from model
+            output = model(
+                src,
+                tgt,
+                src_key_padding_mask=src_padding_mask,
+                tgt_key_padding_mask=tgt_padding_mask,
+                tgt_mask=tgt_mask,
+            )
+            
+            next_token_logits = output[:, -1, :] / max(1e-8, temperature_local)
+            probs = torch.softmax(next_token_logits, dim=-1)
+            probs = top_p_filter(probs, top_p_local)
+            
+            next_token = torch.multinomial(probs, 1)
+            next_token_id = int(next_token.item())
+            
+            # Check for EOS token
+            if next_token_id == tokenizer.token_to_id(EOS_TOKEN):
+                break
+                
+            generated_tokens.append(next_token_id)
+            tgt = torch.cat([tgt, next_token], dim=1)
+        
+        # Convert tokens to text
+        response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return response
+
 # ------------------ Generation with Thinking Logs ------------------
 def generate_coherent_response(
     input_text,
     model,
     word2idx=None,
     idx2word=None,
-    max_length=30,
+    max_length=256,
     temperature_local=temperature,
     top_p_local=top_p,
     repetition_penalty_local=repetition_penalty,
@@ -636,14 +756,12 @@ def generate_coherent_response(
         tokens = text_to_bpe_tokens(input_text, add_special_tokens=False)
         tokens = tokens[-(max_len - 2):]
         src = torch.tensor([tokens + [bpe_tokenizer.token_to_id(EOS_TOKEN)]], device=device)
-        tgt = torch.tensor([[bpe_tokenizer.token_to_id(SOS_TOKEN)]], device=device)
         vocab_size = bpe_tokenizer.get_vocab_size()
     else:
         cleaned = clean_text(input_text)
         tokens = cleaned.split() if cleaned else []
         tokens = tokens[-(max_len - 2):]
-        src = text_to_tensor(tokens + [EOS_TOKEN], word2idx).unsqueeze(0)
-        tgt = torch.tensor([[word2idx[SOS_TOKEN]]], device=device)
+        src = text_to_tensor([SOS_TOKEN] + tokens + [EOS_TOKEN], word2idx).unsqueeze(0)
         vocab_size = len(word2idx)
     
     generated_tokens = []
@@ -651,12 +769,19 @@ def generate_coherent_response(
     thinking_log = []
 
     with torch.no_grad():
+        # Start with SOS token
+        if USE_BPE_TOKENIZATION and bpe_tokenizer:
+            tgt = torch.tensor([[bpe_tokenizer.token_to_id(SOS_TOKEN)]], device=device)
+        else:
+            tgt = torch.tensor([[word2idx[SOS_TOKEN]]], device=device)
+            
         for step in range(max_length):
             if USE_BPE_TOKENIZATION and bpe_tokenizer:
                 src_padding_mask, tgt_padding_mask, tgt_mask = create_bpe_mask(src, tgt, bpe_tokenizer)
             else:
                 src_padding_mask, tgt_padding_mask, tgt_mask = create_mask(src, tgt, word2idx)
                 
+            # Get output from model
             output = model(
                 src,
                 tgt,
@@ -664,8 +789,8 @@ def generate_coherent_response(
                 tgt_key_padding_mask=tgt_padding_mask,
                 tgt_mask=tgt_mask,
             )
-            next_token_logits = output[:, -1, :]
-            next_token_logits = next_token_logits / max(1e-8, temperature_local)
+            
+            next_token_logits = output[:, -1, :] / max(1e-8, temperature_local)
 
             # Apply repetition penalty
             if USE_BPE_TOKENIZATION and bpe_tokenizer:
@@ -692,7 +817,7 @@ def generate_coherent_response(
             
             # Log the thinking process
             if USE_BPE_TOKENIZATION and bpe_tokenizer:
-                next_word = bpe_tokenizer.decode([next_token_id])
+                next_word = bpe_tokens_to_text([next_token_id])
                 eos_token_id = bpe_tokenizer.token_to_id(EOS_TOKEN)
                 pad_token_id = bpe_tokenizer.token_to_id(PAD_TOKEN)
                 unk_token_id = bpe_tokenizer.token_to_id(UNK_TOKEN)
@@ -753,14 +878,14 @@ def scrape_conversation_data(url, max_pages=5):
 
 # ------------------ Training / Inference ------------------
 if TRAIN_MODE:
-    # First pretrain on English corpus
-    pretrained_model, pretrained_tokenizer = None, None
-    if os.path.exists("english_model.txt"):
-        pretrained_model, pretrained_tokenizer = pretrain_model("english_model.txt", epochs=10)
+    # First pretrain on English corpus if enabled
+    pretrained_model = None
+    if ENGLISH_MODEL_TRAIN and os.path.exists("english_model.txt"):
+        pretrained_model, bpe_tokenizer = pretrain_model("english_model.txt", epochs=10)
         print("✅ Pretraining completed on English corpus")
     else:
-        print("⚠️  english_model.txt not found, skipping pretraining")
-    
+        print("⚠️  English model training skipped or english_model.txt not found")
+
     # Load training data
     try:
         from pymongo import MongoClient
@@ -845,16 +970,17 @@ if TRAIN_MODE:
         all_texts.append(intent)
 
     # Train or load BPE tokenizer
+# ... (previous code continues)
+
+    # Train or load BPE tokenizer
     if USE_BPE_TOKENIZATION:
         # If we have a pretrained tokenizer, use it
-        if pretrained_tokenizer is not None:
-            bpe_tokenizer = pretrained_tokenizer
+        if bpe_tokenizer is not None:
             print("Using pretrained BPE tokenizer")
         else:
             # Check if tokenizer files exist and are valid
             vocab_path = "tokenizer/vocab.json"
             merges_path = "tokenizer/merges.txt"
-            tokenizer_json_path = "tokenizer/tokenizer.json"
             
             tokenizer_valid = (
                 os.path.exists(vocab_path) and 
@@ -921,12 +1047,12 @@ if TRAIN_MODE:
         
         if USE_BPE_TOKENIZATION and bpe_tokenizer:
             # Tokenize with BPE
-            src_tensors = [torch.tensor(text_to_bpe_tokens(ctx, add_special_tokens=False), device=device) for ctx in contexts]
+            src_tensors = [torch.tensor(text_to_bpe_tokens(ctx, add_special_tokens=True), device=device) for ctx in contexts]
             tgt_tensors = [torch.tensor(text_to_bpe_tokens(tgt, add_special_tokens=True), device=device) for tgt in targets]
             padding_value = bpe_tokenizer.token_to_id(PAD_TOKEN)
         else:
             # Tokenize with word-level tokenization
-            src_tensors = [text_to_tensor(ctx.split() + [EOS_TOKEN], word2idx) for ctx in contexts]
+            src_tensors = [text_to_tensor([SOS_TOKEN] + ctx.split() + [EOS_TOKEN], word2idx) for ctx in contexts]
             tgt_tensors = [text_to_tensor([SOS_TOKEN] + tgt.split() + [EOS_TOKEN], word2idx) for tgt in targets]
             padding_value = word2idx[PAD_TOKEN]
             
@@ -945,25 +1071,15 @@ if TRAIN_MODE:
 
     # Initialize model
     padding_idx = bpe_tokenizer.token_to_id(PAD_TOKEN) if (USE_BPE_TOKENIZATION and bpe_tokenizer) else word2idx[PAD_TOKEN]
-    model = ImprovedTransformer(vocab_size, d_model, num_heads, num_layers, max_len, 
-                               dropout=dropout_rate, 
-                               padding_idx=padding_idx).to(device)
     
-    # Load pretrained weights if available
+    # Use pretrained model if available, otherwise create a new one
     if pretrained_model is not None:
-        print("Loading pretrained weights...")
-        # Map pretrained weights to our model architecture
-        pretrained_dict = pretrained_model.state_dict()
-        model_dict = model.state_dict()
-        
-        # Filter out unnecessary keys and mismatched sizes
-        pretrained_dict = {k: v for k, v in pretrained_dict.items() 
-                          if k in model_dict and v.size() == model_dict[k].size()}
-        
-        # Update the model's dictionary with pretrained weights
-        model_dict.update(pretrained_dict)
-        model.load_state_dict(model_dict)
-        print("✅ Pretrained weights loaded")
+        model = pretrained_model
+        print("Using pretrained model for fine-tuning")
+    else:
+        model = ImprovedTransformer(vocab_size, d_model, num_heads, num_layers, max_len, 
+                                   dropout=dropout_rate, 
+                                   padding_idx=padding_idx).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
     criterion = nn.CrossEntropyLoss(ignore_index=padding_idx)
@@ -972,7 +1088,6 @@ if TRAIN_MODE:
     epochs = 200
     min_val_loss = float("inf")
     patience_counter = 0
-    early_stopping_patience = 12
 
     print("Starting training with improved transformer...")
 
@@ -993,10 +1108,10 @@ if TRAIN_MODE:
                         text = tensor_to_text(src_batch[i], idx2word)
                     augmented_text = augment_text(text)
                     if USE_BPE_TOKENIZATION and bpe_tokenizer:
-                        augmented_tokens = text_to_bpe_tokens(augmented_text, add_special_tokens=False)
-                        augmented_src.append(torch.tensor(augmented_tokens + [bpe_tokenizer.token_to_id(EOS_TOKEN)], device=device))
+                        augmented_tokens = text_to_bpe_tokens(augmented_text, add_special_tokens=True)
+                        augmented_src.append(torch.tensor(augmented_tokens, device=device))
                     else:
-                        augmented_src.append(text_to_tensor(augmented_text.split() + [EOS_TOKEN], word2idx))
+                        augmented_src.append(text_to_tensor([SOS_TOKEN] + augmented_text.split() + [EOS_TOKEN], word2idx))
                 
                 src_batch = pad_sequence(augmented_src, batch_first=True, padding_value=padding_idx)
                 src_batch = src_batch[:, :max_len]
@@ -1108,7 +1223,7 @@ if TRAIN_MODE:
                         model, 
                         word2idx if not USE_BPE_TOKENIZATION else None,
                         idx2word if not USE_BPE_TOKENIZATION else None,
-                        max_length=30, 
+                        max_length=256, 
                         temperature_local=1.0
                     )
                     print(f"  '{prompt}' -> '{reply}'")
@@ -1116,11 +1231,6 @@ if TRAIN_MODE:
             
             # Switch back to training mode
             model.train()
-
-        # Early stopping check
-        if patience_counter >= early_stopping_patience:
-            print(f"Early stopping at epoch {epoch+1}")
-            break
 
     # Load best model after training
     if os.path.exists("best_model.pth"):
@@ -1136,57 +1246,46 @@ if TRAIN_MODE:
         print("Best model loaded into memory (ready for inference).")
 
 else:
-    # Inference: load checkpoint and start chat
+
+    # Ensure all globals are initialized before use
     if not os.path.exists("best_model.pth"):
         raise FileNotFoundError("best_model.pth not found. Train first or provide checkpoint.")
-    
     checkpoint = torch.load("best_model.pth", map_location=device)
     USE_BPE_TOKENIZATION = checkpoint.get("use_bpe", USE_BPE_TOKENIZATION)
-    
+
     if USE_BPE_TOKENIZATION:
-        # Load BPE tokenizer
         bpe_tokenizer = load_bpe_tokenizer()
-        if bpe_tokenizer is None:
+        if bpe_tokenizer is not None:
+            vocab_size = bpe_tokenizer.get_vocab_size()
+        else:
             print("BPE tokenizer failed to load, falling back to word-level tokenization")
             USE_BPE_TOKENIZATION = False
-        else:
-            vocab_size = bpe_tokenizer.get_vocab_size()
-    
+
     if not USE_BPE_TOKENIZATION:
-        # Load word-level vocabulary
-        word2idx = checkpoint["word2idx"]
-        idx2word = checkpoint["idx2word"]
-        vocab_size = len(word2idx)
-    
-    # Initialize model
+        if "word2idx" in checkpoint and "idx2word" in checkpoint:
+            word2idx = checkpoint["word2idx"]
+            idx2word = checkpoint["idx2word"]
+            vocab_size = len(word2idx)
+        else:
+            print("Word-level vocabulary not found in checkpoint, creating a simple one")
+            special_tokens = [PAD_TOKEN, SOS_TOKEN, EOS_TOKEN, UNK_TOKEN] + list(PERSONALITY_TOKENS.keys()) + list(INTENT_TOKENS.keys())
+            word2idx = {w: i for i, w in enumerate(special_tokens)}
+            idx2word = {i: w for w, i in word2idx.items()}
+            vocab_size = len(word2idx)
+
     padding_idx = bpe_tokenizer.token_to_id(PAD_TOKEN) if (USE_BPE_TOKENIZATION and bpe_tokenizer) else word2idx[PAD_TOKEN]
     model = ImprovedTransformer(
-        vocab_size, 
-        checkpoint["d_model"], 
-        checkpoint["num_heads"], 
-        checkpoint["num_layers"], 
-        checkpoint["max_len"], 
+        vocab_size,
+        checkpoint["d_model"],
+        checkpoint["num_heads"],
+        checkpoint["num_layers"],
+        checkpoint["max_len"],
         dropout=dropout_rate,
         padding_idx=padding_idx
     ).to(device)
-    
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     print("Loaded model from best_model.pth")
-
-    # ------------------ Load Pretrained English Model if available ------------------
-    if os.path.exists("pretrained_model.pt"):
-        print("Loading pretrained English model for enhanced understanding...")
-        pretrained_model = TransformerLM(
-            vocab_size,
-            d_model=d_model,
-            nhead=num_heads,
-            num_layers=num_layers,
-            dropout=dropout_rate
-        ).to(device)
-        pretrained_model.load_state_dict(torch.load("pretrained_model.pt", map_location=device))
-        pretrained_model.eval()
-        print("✅ Pretrained English model loaded for enhanced understanding")
 
     import gradio as gr
 
@@ -1236,7 +1335,7 @@ else:
             model,
             word2idx if not USE_BPE_TOKENIZATION else None,
             idx2word if not USE_BPE_TOKENIZATION else None,
-            max_length=30,
+            max_length=256,
             temperature_local=temperature,
             top_p_local=top_p,
             repetition_penalty_local=repetition_penalty
@@ -1295,4 +1394,3 @@ else:
         clear_btn.click(lambda: ([], []), None, [chatbot, msg], queue=False)
 
         demo.launch(server_name="0.0.0.0", server_port=7860)
-        
