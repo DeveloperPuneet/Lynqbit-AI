@@ -72,7 +72,7 @@ INTENT_TOKENS = {
 }
 
 # ------------------ Flags ------------------
-TRAIN_MODE = True
+TRAIN_MODE = False
 ENGLISH_MODEL_TRAIN = False  # Set to False to skip English model pretraining
 DEBUG_THINKING = True
 MINI_REPLAY_ENABLED = True
@@ -89,10 +89,10 @@ UNK_TOKEN = "<UNK>"
 SPECIAL_TOKENS = [SOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN] + list(PERSONALITY_TOKENS.keys()) + list(INTENT_TOKENS.keys())
 
 # ------------------ Model parameters ------------------
-d_model = 256
+d_model = 512
 num_heads = 8
 num_layers = 4
-max_len = 256  # Increased from 60 to 256 for better context
+max_len = 768  # Increased from 60 to 256 for better context
 batch_size = 16
 temperature = 1.0
 top_p = 0.98
@@ -129,7 +129,7 @@ class MultiTurnDataset(Dataset):
         return context, target
 
 class PretrainDataset(Dataset):
-    def __init__(self, file_path, tokenizer, block_size=256):
+    def __init__(self, file_path, tokenizer, block_size=768):
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
         
